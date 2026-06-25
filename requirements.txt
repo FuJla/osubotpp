@@ -1,0 +1,4 @@
+ossapi
+irc
+rosu-pp-py
+requests
