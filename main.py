@@ -4,6 +4,8 @@ import requests
 import irc.bot
 from ossapi import Ossapi
 from rosu_pp_py import Beatmap, Performance
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import os
 
 # --- НАСТРОЙКИ ---
 IRC_PASSWORD = "ac576156"  # Ваш IRC-пароль с сайта osu!
@@ -21,7 +23,7 @@ class OsuRecentBot(irc.bot.SingleServerIRCBot):
 
     def on_welcome(self, connection, event):
         print("Бот успешно зашел на Bancho! Мониторинг запущен.")
-        # Запускаем бесконечный опрос в отдельном потоке
+        # Запускаем бесконечный опрос API в отдельном потоке
         threading.Thread(target=self.track_recent_scores, daemon=True).start()
 
     def track_recent_scores(self):
@@ -80,6 +82,25 @@ class OsuRecentBot(irc.bot.SingleServerIRCBot):
         except Exception as e:
             print(f"Не удалось отправить IRC сообщение: {e}")
 
+# Создаем фейковый веб-сервер для Render, чтобы тариф Free не засыпал
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(b"Bot is running successfully!")
+
+def run_web_server():
+    # Render автоматически передает порт, берем его или ставим 8000
+    port = int(os.environ.get("PORT", 8000))
+    server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
+    print(f"Фейковый веб-сервер запущен на порту {port}")
+    server.serve_forever()
+
 if __name__ == "__main__":
+    # Запускаем фейковый веб-сайт в отдельном потоке для Render
+    threading.Thread(target=run_web_server, daemon=True).start()
+    
+    # Запускаем нашего основного osu! бота
     bot = OsuRecentBot()
     bot.start()
