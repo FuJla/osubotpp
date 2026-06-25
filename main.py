@@ -1,106 +1,83 @@
-import time
+import os
 import threading
 import requests
 import irc.bot
-from ossapi import Ossapi
+from flask import Flask, request, jsonify
 from rosu_pp_py import Beatmap, Performance
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import os
 
 # --- НАСТРОЙКИ ---
-IRC_PASSWORD = "ac576156"  # Ваш IRC-пароль с сайта osu!
-USER_NAME = "showheart"             # Ваш токен-ник в игре (без пробелов, используйте _)
-CLIENT_ID = 61392                         # Client ID из настроек OAuth
-CLIENT_SECRET = "XdsyysAqQFZzVec4XadziznQ8HhBZ26bwYWovbcS" # Client Secret из настроек OAuth
+IRC_PASSWORD = "ac576156"  # Ваш IRC-пароль с сайта osu.ppy.sh/p/irc
+USER_NAME = "showheart"             # Ваш ник в игре (пробелы замените на _)
 
-class OsuRecentBot(irc.bot.SingleServerIRCBot):
+app = Flask(__name__)
+irc_client = None
+
+class OsuIRCClient(irc.bot.SingleServerIRCBot):
     def __init__(self):
-        # Подключаемся к Bancho под вашим именем
         super().__init__([("irc.ppy.sh", 6667, IRC_PASSWORD)], USER_NAME, USER_NAME)
-        self.api = Ossapi(CLIENT_ID, CLIENT_SECRET)
-        self.last_score_id = None
-        self.user_id = self.api.user(USER_NAME).id
 
     def on_welcome(self, connection, event):
-        print("Бот успешно зашел на Bancho! Мониторинг запущен.")
-        # Запускаем бесконечный опрос API в отдельном потоке
-        threading.Thread(target=self.track_recent_scores, daemon=True).start()
+        print("Бот успешно подключился к Bancho IRC!")
 
-    def track_recent_scores(self):
-        while True:
-            try:
-                # Берем самую последнюю сыгранную карту
-                recent_scores = self.api.user_scores(self.user_id, type="recent", limit=1)
-                
-                if recent_scores:
-                    score = recent_scores
-                    
-                    if score.id != self.last_score_id:
-                        if self.last_score_id is not None:
-                            self.process_and_send_score(score)
-                        self.last_score_id = score.id
-            except Exception as e:
-                print(f"Ошибка API: {e}")
-                
-            time.sleep(12) # Безопасный интервал опроса API
-
-    def process_and_send_score(self, score):
-        acc = score.accuracy * 100
-        c300 = score.statistics.count_300
-        c100 = score.statistics.count_100
-        c50 = score.statistics.count_50
-        miss = score.statistics.count_miss
-
-        if score.pp:
-            pp_value = score.pp
-        else:
-            try:
-                # Скачиваем .osu файл для точного просчета PP на unranked/loved
-                map_file = requests.get(f"https://ppy.sh{score.beatmap.id}").content
-                bmap = Beatmap(bytes=map_file)
-                perf = Performance(accuracy=acc, misses=miss, n100=c100, n50=c50, combo=score.max_combo)
-                
-                if score.mods:
-                    perf.set_mods(score.mods.value)
-                    
-                pp_value = perf.calculate(bmap).pp
-            except Exception:
-                pp_value = 0
-
-        # Специфический тег [https://ppy.sh ID Текст] делает ссылку кликабельной в чате osu!
-        message = (
-            f" [https://ppy.sh{score.beatmap.id} {score.beatmapset.title} [{score.beatmap.version}]] "
-            f"| Acc: {acc:.2f}% "
-            f"| 300: {c300} | 100: {c100} | 50: {c50} | Miss: {miss} "
-            f"| PP: {pp_value:.2f}pp"
-        )
-
+    def send_osu_message(self, message):
         try:
-            # Отправка сообщения самому себе в ЛС внутри игры
             self.connection.privmsg(USER_NAME, message)
-            print(f"Отправлен результат для {score.beatmapset.title}")
+            print("Сообщение успешно отправлено в ЛС osu!")
         except Exception as e:
-            print(f"Не удалось отправить IRC сообщение: {e}")
+            print(f"Ошибка отправки IRC: {e}")
 
-# Создаем фейковый веб-сервер для Render, чтобы тариф Free не засыпал
-class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html; charset=utf-8')
-        self.end_headers()
-        self.wfile.write(b"Bot is running successfully!")
+@app.route('/', methods=['GET'])
+def health_check():
+    return "Бот работает!", 200
 
-def run_web_server():
-    # Render автоматически передает порт, берем его или ставим 8000
-    port = int(os.environ.get("PORT", 8000))
-    server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
-    print(f"Фейковый веб-сервер запущен на порту {port}")
-    server.serve_forever()
+@app.route('/webhook', methods=['POST'])
+def osu_webhook():
+    data = request.get_json()
+    if not data or data.get("event") != "user.score.new":
+        return jsonify({"status": "ignored"}), 200
+
+    score_data = data.get("data", {})
+    acc = score_data.get("accuracy", 0) * 100
+    statistics = score_data.get("statistics", {})
+    c300 = statistics.get("count_300", 0)
+    c100 = statistics.get("count_100", 0)
+    c50 = statistics.get("count_50", 0)
+    miss = statistics.get("count_miss", 0)
+    max_combo = score_data.get("max_combo", 0)
+    
+    beatmap = score_data.get("beatmap", {})
+    beatmap_id = beatmap.get("id")
+    beatmapset = score_data.get("beatmapset", {})
+
+    if score_data.get("pp"):
+        pp_value = score_data.get("pp")
+    else:
+        try:
+            map_file = requests.get(f"https://ppy.sh{beatmap_id}").content
+            bmap = Beatmap(bytes=map_file)
+            perf = Performance(accuracy=acc, misses=miss, n100=c100, n50=c50, combo=max_combo)
+            pp_value = perf.calculate(bmap).pp
+        except:
+            pp_value = 0
+
+    message = (
+        f" [https://ppy.sh{beatmap_id} {beatmapset.get('title', 'Map')} [{beatmap.get('version', 'Diff')}]] "
+        f"| Acc: {acc:.2f}% | 300: {c300} | 100: {c100} | 50: {c50} | Miss: {miss} | PP: {pp_value:.2f}pp"
+    )
+
+    if irc_client and irc_client.connection.is_connected():
+        irc_client.send_osu_message(message)
+
+    return jsonify({"status": "success"}), 200
+
+def start_irc():
+    global irc_client
+    irc_client = OsuIRCClient()
+    irc_client.start()
 
 if __name__ == "__main__":
-    # Запускаем фейковый веб-сайт в отдельном потоке для Render
-    threading.Thread(target=run_web_server, daemon=True).start()
-    
-    # Запускаем нашего основного osu! бота
-    bot = OsuRecentBot()
-    bot.start()
+    # Запускаем постоянное подключение IRC в фоне
+    threading.Thread(target=start_irc, daemon=True).start()
+    # Запускаем веб-сервер Flask для приема вебхуков от osu!
+    port = int(os.environ.get("PORT", 7860))  # Папка Spaces слушает порт 7860
+    app.run(host="0.0.0.0", port=port)
